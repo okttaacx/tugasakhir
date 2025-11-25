@@ -1,0 +1,271 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\User;
+use App\Models\Profile;
+use App\Models\Training;
+use App\Models\DeletionReason; // Import DeletionReason model
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use App\Models\Pelaporan;
+use Illuminate\Support\Facades\Hash;
+use Carbon\Carbon; // Import Carbon untuk tanggal
+
+class AdminController extends Controller
+{
+    public function dashboard()
+    {
+        // Mengambil data user dengan profile
+        $users = User::with('profile')->get();
+
+        // Filter user yang memiliki role 'user'
+        $users = $users->filter(fn($user) => $user->hasRole('user'));
+
+        // Menghitung jumlah pengguna dengan role 'user'
+        $pencakerCount = User::role('user')->count();
+
+        // Menghitung jumlah pelatihan yang tersedia
+        $trainingCount = Training::count();
+
+        // TAMBAHAN: Hitung kunjungan hari ini dan kemarin
+        $visitorsToday = DB::table('visits')->whereDate('created_at', today())->count();
+        $visitorsYesterday = DB::table('visits')->whereDate('created_at', Carbon::yesterday())->count();
+
+        // Hitung persentase perubahan kunjungan
+        $visitChangePercent = 0;
+        if ($visitorsYesterday > 0) {
+            $visitChangePercent = (($visitorsToday - $visitorsYesterday) / $visitorsYesterday) * 100;
+        } elseif ($visitorsToday > 0) {
+            $visitChangePercent = 100;
+        }
+
+        // Menghitung desa dengan jumlah peserta tertinggi
+        $desaTertinggi = Profile::select('desa')
+            ->selectRaw('count(*) as total_peserta')
+            ->join('users', 'profiles.user_id', '=', 'users.id')
+            ->whereHas('user.roles', function ($query) {
+                $query->where('name', 'user'); // Sesuaikan role
+            })
+            ->groupBy('desa')
+            ->orderByDesc('total_peserta')
+            ->first();
+
+        // Data desa untuk diagram batang
+
+        $desaData = Profile::select('desa', DB::raw('count(*) as total'))
+            ->whereHas('user.roles', function ($query) {
+                $query->where('name', 'admin'); // Filter hanya yang memiliki role "admin"
+            })
+            ->groupBy('desa')
+            ->get();
+
+        // Data kecamatan untuk diagram batang
+        $kecamatanData = Profile::select('kecamatan', DB::raw('count(*) as total'))
+            ->whereHas('user.roles', function ($query) {
+                $query->where('name', 'admin'); // Filter hanya yang memiliki role "admin"
+            })
+            ->groupBy('kecamatan')
+            ->get();
+
+        // Menghitung jumlah peserta per pelatihan
+        $trainingParticipants = Training::leftJoin('registrations', 'trainings.id', '=', 'registrations.training_id')
+            ->select('trainings.title', DB::raw('COUNT(registrations.user_id) as total_peserta'))
+            ->groupBy('trainings.title')
+            ->get();
+
+        // Kirim data ke view dashboard dengan variabel kunjungan
+        return view('admin.dashboard', compact(
+            'users',
+            'pencakerCount',
+            'trainingCount',
+            'visitorsToday',
+            'visitorsYesterday',
+            'visitChangePercent',
+            'desaTertinggi',
+            'desaData',
+            'kecamatanData',
+            'trainingParticipants'
+        ));
+    }
+
+    public function indexDashboard()
+    {
+        // Menghitung jumlah pencaker aktif dari database
+        $pencakerCount = User::where('status', 'aktif')->count();
+
+        // Kirim data $pencakerCount ke view
+        return view('admin.dashboard', compact('pencakerCount'));
+    }
+
+    public function accountParticipants(Request $request)
+    {
+        // Ambil nilai pencarian dari input
+        $search = $request->input('search');
+
+        // Query untuk mengambil user dengan fitur pencarian
+        $users = User::query();
+
+        if ($search) {
+            $users->where(function ($query) use ($search) {
+                $query->where('name', 'LIKE', "%$search%")
+                    ->orWhere('email', 'LIKE', "%$search%");
+            });
+        }
+
+        // Ambil data dengan pagination (10 per halaman)
+        $users = $users->paginate(10);
+
+        return view('admin.account-participant', [
+            'users' => $users,
+            'search' => $search, // Agar input tetap ada setelah pencarian
+        ]);
+    }
+
+    public function changeRole($id)
+    {
+        // Ambil user berdasarkan ID
+        $user = User::findOrFail($id);
+
+        // Mengubah role: jika 'user' maka ganti ke 'admin', jika 'admin' ganti ke 'user'
+        if ($user->hasRole('user')) {
+            $user->removeRole('user');
+            $user->assignRole('admin');
+        } else {
+            $user->removeRole('admin');
+            $user->assignRole('user');
+        }
+
+        // Simpan perubahan role
+        $user->save();
+
+        // Redirect kembali ke halaman daftar akun peserta dengan pesan sukses
+        return redirect()->route('admin.account_participants')->with('success', 'Role pengguna berhasil diubah.');
+    }
+
+    // Menampilkan daftar pengunduran diri yang belum diverifikasi
+    public function withdrawalRequests()
+    {
+        $withdrawalRequests = DeletionReason::where('status', 'pending')->with('user', 'admin')->get();
+        return view('admin.withdrawals', compact('withdrawalRequests'));
+    }
+
+    // Verifikasi pengunduran diri
+    public function verifyWithdrawal($id)
+    {
+        $withdrawal = DeletionReason::findOrFail($id);
+        $withdrawal->status = 'verified'; // Ubah status menjadi terverifikasi
+        $withdrawal->save();
+
+        // Hapus pendaftaran pelatihan setelah verifikasi
+        DB::table('registrations')
+            ->where('user_id', $withdrawal->user_id)
+            ->delete();
+
+        return redirect()->route('admin.withdrawals')->with('success', 'Pengunduran diri telah diverifikasi dan pengguna telah dikeluarkan dari pelatihan.');
+    }
+
+    // Menolak pengunduran diri
+    public function rejectWithdrawal($id)
+    {
+        $withdrawal = DeletionReason::findOrFail($id);
+        $withdrawal->status = 'rejected'; // Ubah status menjadi ditolak
+        $withdrawal->save();
+
+        return redirect()->route('admin.withdrawals')->with('success', 'Pengunduran diri telah ditolak.');
+    }
+
+    // Menampilkan riwayat penghapusan peserta
+    public function deletionHistory()
+    {
+        $deletionHistory = DeletionReason::with('user', 'admin')->get();
+        return view('admin.deletion-history', compact('deletionHistory'));
+    }
+
+    // Menghapus peserta oleh admin dengan alasan
+    public function deleteParticipant(Request $request, $user_id)
+    {
+        $request->validate([
+            'reason' => 'required|string',
+        ]);
+
+        $user = User::findOrFail($user_id);
+
+        // Log alasan penghapusan peserta
+        DeletionReason::create([
+            'user_id' => $user->id,
+            'admin_id' => auth()->id(),
+            'reason' => $request->reason,
+            'status' => 'pending', // Default status pending
+        ]);
+
+        // Hapus peserta
+        $user->delete();
+
+        return redirect()->route('admin.deletionHistory')->with('success', 'Peserta telah dihapus dan alasan penghapusan telah dicatat.');
+    }
+
+    // Verifikasi penghapusan peserta
+    public function verifyDeletion($id)
+    {
+        $deletion = DeletionReason::findOrFail($id);
+        $deletion->status = 'verified'; // Ubah status menjadi terverifikasi
+        $deletion->save();
+
+        return redirect()->route('admin.deletionHistory')->with('success', 'Penghapusan peserta telah diverifikasi.');
+    }
+
+    public function indexPelaporan()
+    {
+        // Mengambil semua data dari tabel pelaporans
+        $pelaporans = Pelaporan::all();
+
+        // Mengirim data ke view
+        return view('admin.pelaporan-admin', compact('pelaporans'));
+    }
+
+    public function profile()
+    {
+        $admin = auth()->user();
+        return view('admin.profile', compact('admin'));
+    }
+
+    /**
+     * Update profil admin
+     */
+    public function updateProfile(Request $request)
+    {
+        $request->validate([
+            'name' => 'required|string|max:255',
+            'email' => 'required|string|email|max:255|unique:users,email,' . auth()->id(),
+            'current_password' => 'nullable|required_with:new_password',
+            'new_password' => 'nullable|min:8|confirmed',
+        ], [
+            'name.required' => 'Nama wajib diisi.',
+            'email.required' => 'Email wajib diisi.',
+            'email.unique' => 'Email sudah digunakan.',
+            'current_password.required_with' => 'Password saat ini wajib diisi jika ingin mengubah password.',
+            'new_password.min' => 'Password baru minimal 8 karakter.',
+            'new_password.confirmed' => 'Konfirmasi password tidak cocok.',
+        ]);
+
+        $admin = auth()->user();
+
+        // Update nama dan email
+        $admin->name = $request->name;
+        $admin->email = $request->email;
+
+        // Update password jika diisi
+        if ($request->filled('current_password')) {
+            if (!Hash::check($request->current_password, $admin->password)) {
+                return back()->withErrors(['current_password' => 'Password saat ini tidak benar.']);
+            }
+            
+            $admin->password = Hash::make($request->new_password);
+        }
+
+        $admin->save();
+
+        return redirect()->route('admin.profile')->with('success', 'Profil berhasil diperbarui.');
+    }
+}
